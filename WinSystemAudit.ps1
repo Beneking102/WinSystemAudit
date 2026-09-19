@@ -492,23 +492,22 @@ function Invoke-DriverInventory {
     }
 
     # DriverStore: mehrfach vorliegende Versionen desselben INF (nur elevated zuverlaessig lesbar)
+    $driverStoreDupes = New-Object System.Collections.Generic.List[object]
     if ($script:IsElevated) {
         Write-Host ""
         Write-Info "DriverStore: Pakete mit mehreren Versionen desselben Treibers (pnputil):"
-        $pnp = & pnputil.exe /enum-drivers 2>$null
-        $pkgs = New-Object System.Collections.Generic.List[object]
-        $cur = @{}
-        foreach ($line in $pnp) {
-            if     ($line -match '^\s*(Ver.ffentlichter Name|Published Name)\s*:\s*(.+)$') { if ($cur.Count) { $pkgs.Add([pscustomobject]$cur) }; $cur = @{ Published = $Matches[2].Trim() } }
-            elseif ($line -match '^\s*(Originalname|Original Name)\s*:\s*(.+)$')           { $cur.Original = $Matches[2].Trim() }
-            elseif ($line -match '^\s*(Anbietername|Provider Name)\s*:\s*(.+)$')           { $cur.Provider = $Matches[2].Trim() }
-        }
-        if ($cur.Count) { $pkgs.Add([pscustomobject]$cur) }
-        $dupGroups = $pkgs | Group-Object Original | Where-Object { $_.Count -gt 1 } | Sort-Object Count -Descending
+        $dupGroups = Get-DriverStoreDuplicateGroups
         if ($dupGroups) {
             foreach ($dg in $dupGroups) {
-                Write-Warn2 ("  {0} - {1}x im DriverStore (jeweils alle bis auf die neueste Version entfernbar via 'pnputil /delete-driver')" -f $dg.Name, $dg.Count)
-                Add-Finding 'Treiber' "DriverStore-Duplikate: $($dg.Name)" "$($dg.Count) Versionen dieses INF im DriverStore. Aeltere ueber 'pnputil /delete-driver oemXX.inf' entfernbar - niemals im Dateisystem loeschen." 0 'niedrig'
+                $resolved = Resolve-DriverStoreKeepDrop -Group $dg
+                if ($resolved.Ambiguous) {
+                    Write-Warn2 ("  {0} - {1}x im DriverStore, Datum nicht eindeutig bestimmbar - manuell mit 'pnputil /enum-drivers' pruefen" -f $dg.Name, $dg.Count)
+                    Add-Finding 'Treiber' "DriverStore-Duplikate (Datum unklar): $($dg.Name)" "$($dg.Count) Versionen, automatischer Abgleich nicht moeglich. Niemals raten - manuell mit 'pnputil /enum-drivers' pruefen." 0 'niedrig'
+                    continue
+                }
+                Write-Warn2 ("  {0} - behalte {1} ({2:yyyy-MM-dd}), {3} aeltere entfernbar via 'pnputil /delete-driver'" -f $dg.Name, $resolved.Keep.Published, $resolved.Keep.Date, $resolved.Drop.Count)
+                Add-Finding 'Treiber' "DriverStore-Duplikate: $($dg.Name)" "$($resolved.Drop.Count) aeltere Version(en) entfernbar, behalte $($resolved.Keep.Published) vom $($resolved.Keep.Date.ToString('yyyy-MM-dd'))." 0 'niedrig'
+                foreach ($d in $resolved.Drop) { $driverStoreDupes.Add($d) }
             }
         } else {
             Write-Ok "Keine mehrfach vorliegenden DriverStore-Pakete gefunden."
@@ -516,8 +515,75 @@ function Invoke-DriverInventory {
     } else {
         Write-Warn2 "DriverStore-Duplikate koennen nur elevated zuverlaessig ermittelt werden."
     }
+    $script:LastDriverStoreDupes = $driverStoreDupes
 
     return $drivers
+}
+
+function Get-DriverStoreDuplicateGroups {
+    # pnputil-Feldname ist "Treiberversion"/"Driver Version" und enthaelt Datum+Versionsnummer kombiniert,
+    # z.B. "07/16/2026 10.0.22029.3" - AUCH auf nicht-englischen Windows-Installationen im MM/DD/YYYY-Format.
+    # ("Treiberdatum und -version" existiert als Feldname nicht - das war ein frueherer Bug in diesem Skript.)
+    $pnp = & pnputil.exe /enum-drivers 2>$null
+    $pkgs = New-Object System.Collections.Generic.List[object]
+    $cur = @{}
+    foreach ($line in $pnp) {
+        if     ($line -match '^\s*(Ver.ffentlichter Name|Published Name)\s*:\s*(.+)$') { if ($cur.Count) { $pkgs.Add([pscustomobject]$cur) }; $cur = @{ Published = $Matches[2].Trim() } }
+        elseif ($line -match '^\s*(Originalname|Original Name)\s*:\s*(.+)$')           { $cur.Original = $Matches[2].Trim() }
+        elseif ($line -match '^\s*(Anbietername|Provider Name)\s*:\s*(.+)$')           { $cur.Provider = $Matches[2].Trim() }
+        elseif ($line -match '^\s*(Treiberversion|Driver Version)\s*:\s*(.+)$')        { $cur.DateVer = $Matches[2].Trim() }
+    }
+    if ($cur.Count) { $pkgs.Add([pscustomobject]$cur) }
+    return $pkgs | Group-Object Original | Where-Object { $_.Count -gt 1 } | Sort-Object Count -Descending
+}
+
+function Resolve-DriverStoreKeepDrop {
+    param($Group)
+    # Unterstuetzt sowohl MM/DD/YYYY (pnputil-Standard, auch auf lokalisierten Systemen) als auch
+    # DD.MM.YYYY (falls ein System das doch lokalisiert ausgibt) - lieber beide probieren als falsch raten.
+    $parsed = $Group.Group | ForEach-Object {
+        $d = $null
+        if ($_.DateVer -match '(\d{1,2}/\d{1,2}/\d{4})')      { try { $d = [datetime]::ParseExact($Matches[1], 'M/d/yyyy', $null) } catch {} }
+        elseif ($_.DateVer -match '(\d{1,2}\.\d{1,2}\.\d{4})') { try { $d = [datetime]::ParseExact($Matches[1], 'd.M.yyyy', $null) } catch {} }
+        [pscustomobject]@{ Published = $_.Published; Original = $_.Original; Date = $d; Raw = $_.DateVer }
+    }
+    $withDate = $parsed | Where-Object { $_.Date }
+    if ($withDate.Count -ne $parsed.Count -or $withDate.Count -le 1) {
+        return [pscustomobject]@{ Ambiguous = $true; Keep = $null; Drop = @() }
+    }
+    $sorted = $withDate | Sort-Object Date -Descending
+    return [pscustomobject]@{ Ambiguous = $false; Keep = $sorted[0]; Drop = @($sorted | Select-Object -Skip 1) }
+}
+
+function Invoke-DownloadsDuplicateInventory {
+    Write-Section "Downloads-Ordner: moegliche Mehrfach-Downloads (nur Hinweis, keine Loeschung)"
+    $dl = Join-Path $env:USERPROFILE 'Downloads'
+    if (-not (Test-Path $dl)) { Write-Info "Kein Downloads-Ordner gefunden."; return @() }
+
+    # Windows haengt bei erneutem Download automatisch " (1)", " (2)", ... an den Dateinamen an.
+    # Das erkennt zuverlaessig echte Mehrfach-Downloads, ohne Dateiinhalte vergleichen zu muessen.
+    $items = Get-ChildItem $dl -Force -EA SilentlyContinue
+    $groups = $items | ForEach-Object {
+        $base = $_.Name -replace '\s*\(\d+\)(\.[^.]+)?$', '$1'
+        [pscustomobject]@{ Base = $base; Item = $_ }
+    } | Group-Object Base | Where-Object { $_.Count -gt 1 }
+
+    $results = New-Object System.Collections.Generic.List[object]
+    foreach ($g in $groups) {
+        $withSize = $g.Group | ForEach-Object {
+            $bytes = if ($_.Item.PSIsContainer) { Get-DirSizeBytes $_.Item.FullName } else { $_.Item.Length }
+            [pscustomobject]@{ Name = $_.Item.Name; GB = Format-GB $bytes; Date = $_.Item.LastWriteTime }
+        } | Sort-Object Date
+        $totalGB = [math]::Round((($withSize | Measure-Object GB -Sum).Sum), 2)
+        if ($totalGB -lt 0.1) { continue }
+        Write-Warn2 ("{0} ({1} Versionen, zusammen {2:N2} GB):" -f $g.Name, $g.Count, $totalGB)
+        $withSize | ForEach-Object { Write-Info ("    {0}  {1:N2} GB  {2}" -f $_.Date.ToString('yyyy-MM-dd'), $_.GB, $_.Name) }
+        Add-Finding 'Downloads' "Mehrfach-Download: $($g.Name)" ("$($g.Count) Versionen (" + (($withSize | ForEach-Object { $_.Name }) -join ', ') + "), zusammen $totalGB GB. Nur die neueste wird typischerweise noch gebraucht - manuell pruefen, dieses Tool loescht in Downloads nichts automatisch.") $totalGB 'niedrig'
+        $results.Add([pscustomobject]@{ Base = $g.Name; Versions = $withSize; TotalGB = $totalGB })
+    }
+    if ($results.Count -eq 0) { Write-Ok "Keine offensichtlichen Mehrfach-Downloads gefunden." }
+    Write-Info "Hinweis: Dieses Tool bietet fuer Downloads bewusst KEINE automatische Loeschung an - das ist dein persoenlicher Ordner, nicht regenerierbarer Cache."
+    return $results
 }
 
 function Invoke-WindowsConfigCheck {
@@ -648,6 +714,23 @@ function Invoke-FixBloatware {
     }
 }
 
+function Invoke-FixDriverStoreDuplicates {
+    param($Dupes)
+    if (-not $Dupes -or $Dupes.Count -eq 0) { Write-Info "Nichts zu tun."; return }
+    if (-not $script:IsElevated) { Write-Warn2 "DriverStore-Bereinigung braucht Administratorrechte - uebersprungen."; return }
+    foreach ($d in $Dupes) {
+        if (Confirm-Action ("Aeltere DriverStore-Version entfernen? {0} (Original: {1}, vom {2:yyyy-MM-dd})" -f $d.Published, $d.Original, $d.Date)) {
+            $out = & pnputil.exe /delete-driver $d.Published /force 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Log-Change "pnputil /delete-driver $($d.Published) /force  (Original: $($d.Original), $($d.Date.ToString('yyyy-MM-dd')))"
+                Write-Ok "Entfernt."
+            } else {
+                Write-Bad "Konnte nicht entfernt werden (moeglicherweise noch aktiv einem Geraet zugeordnet): $out"
+            }
+        }
+    }
+}
+
 function Invoke-FixRecycleBin {
     Write-Section "Papierkorb"
     $totalBytes = 0
@@ -707,6 +790,7 @@ function Show-Banner {
 
 function Invoke-FullInventory {
     $script:Findings.Clear()
+    $script:LastDriverStoreDupes = @()
     Invoke-HardwareInventory
     Invoke-StabilityCheck
     $script:LastOrphans  = Invoke-AutostartInventory
@@ -716,6 +800,7 @@ function Invoke-FullInventory {
     $script:LastBuffers  = Invoke-GameDownloadBufferInventory
     $script:LastVSCode   = Invoke-VSCodeExtensionInventory
     $script:LastBloat    = Invoke-BloatwareInventory
+    Invoke-DownloadsDuplicateInventory | Out-Null
     Invoke-WindowsConfigCheck
 
     Write-Section "Zusammenfassung"
@@ -738,6 +823,7 @@ function Show-FixMenu {
     if ($script:LastBuffers.Count -gt 0) { Write-Host "`n--- Spiele-Downloadpuffer ---"; Invoke-FixGameBuffers $script:LastBuffers }
     if ($script:LastVSCode.Count  -gt 0) { Write-Host "`n--- VS-Code-Extensions ---"; Invoke-FixVSCodeExtensions $script:LastVSCode }
     if ($script:LastBloat.Count   -gt 0) { Write-Host "`n--- Optionale Apps ---"; Invoke-FixBloatware $script:LastBloat }
+    if ($script:LastDriverStoreDupes.Count -gt 0) { Write-Host "`n--- DriverStore-Duplikate ---"; Invoke-FixDriverStoreDuplicates $script:LastDriverStoreDupes }
     Write-Host "`n--- Papierkorb ---"; Invoke-FixRecycleBin
 
     Export-Report

@@ -48,6 +48,7 @@ is one file — no hidden modules, no download-on-first-run.
 | Game-launcher download buffers | Steam libraries discovered from `libraryfolders.vdf`; only the `downloading` subfolder | Abandoned/failed downloads can silently eat hundreds of GB and are trivially safe to clear |
 | VS Code extensions | Duplicate version folders (only the *currently active* version, verified via `code --list-extensions`, is ever kept) and orphaned GUID folders from interrupted installs | Extension folders don't clean up after themselves; this does it correctly without ever guessing which version is "the right one" |
 | Optional Store apps | Presence-check against a curated list (Bing apps, Solitaire, Clipchamp, Instagram, Maps, Feedback Hub, GetHelp, DevHome, Zune apps, Xbox overlay, Quick Assist, ...) | Purely informational — the script explicitly does **not** assume you don't use these; it just tells you they're there |
+| Downloads folder duplicates | Files/folders Windows itself suffixed with `(1)`, `(2)`, ... because a same-named file already existed | **Report-only, on purpose** — this is your personal folder, not a regenerable cache, so the tool will never offer to delete anything here. It just tells you what to look at yourself |
 | Security/perf posture | Hardware-accelerated GPU scheduling, Game DVR, Defender real-time protection, Fast-Startup capability | Quick read of settings that are commonly wrong for either gaming or dev workloads |
 
 ## What it can fix (menu option 2 — only after running the inventory)
@@ -62,6 +63,10 @@ offered before the first change in a session (elevated only).
 - Clear a specific game-launcher download buffer (launcher-running check first)
 - Remove a specific old or orphaned VS Code extension folder
 - Remove a specific optional Store app
+- Remove a specific superseded DriverStore package (the currently-active
+  driver for each device is always identified and kept — `pnputil`
+  itself additionally refuses to remove a package still bound to a
+  device, so this can't disable working hardware)
 - Empty the Recycle Bin
 
 Nothing here is a "clean everything" button. There isn't one, on purpose.
