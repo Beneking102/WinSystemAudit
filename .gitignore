@@ -1,0 +1,3 @@
+# Generated reports contain machine-specific paths/inventory - never commit them
+Report_*.md
+*.log
