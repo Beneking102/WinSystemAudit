@@ -91,6 +91,9 @@ Nothing here is a "clean everything" button. There isn't one, on purpose.
   [OK] Geleert.
 ```
 
+See [`docs/sample-report.md`](docs/sample-report.md) for an anonymized
+example of the Markdown report the tool writes out.
+
 ## Usage
 
 ```powershell
